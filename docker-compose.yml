@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  stable-audio-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: thecollabagepatch/stable-gary-api:latest
+    container_name: stable-audio-api
+    
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTHONUNBUFFERED=1
+      - HF_HOME=/app/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN}
+    
+    # Volumes for model caching
+    volumes:
+      - ./cache:/app/.cache
+      - ./outputs:/app/outputs  # Optional: for debugging
+    
+    # Expose API port
+    ports:
+      - "8005:8005"
+    
+    # Keep container running for API
+    restart: unless-stopped
