@@ -524,6 +524,9 @@ def generate_loop():
     Generate BPM-aware loop from audio with smart bar calculation.
     Automatically selects optimal bar count based on BPM to fit within ~10s.
     Supports both text-to-audio and style transfer modes.
+
+    Generate BPM-aware loop with smart bar calculation.
+    NOW ACCEPTS BOTH JSON AND FORM DATA for better API consistency!
     
     Form Data (Style Transfer):
     - audio_file: Input audio file (optional)
@@ -543,18 +546,41 @@ def generate_loop():
     - Always chooses largest power-of-2 that fits in ~10s
     """
     try:
-        # Parse form parameters
-        prompt = request.form.get('prompt')
-        if not prompt:
-            return jsonify({"error": "prompt is required"}), 400
+        # Detect content type and parse accordingly
+        content_type = request.headers.get('Content-Type', '').lower()
         
-        loop_type = request.form.get('loop_type', 'auto')  # "drums", "instruments", or "auto"
-        bars = request.form.get('bars')  # Optional, will auto-detect if not provided
-        style_strength = float(request.form.get('style_strength', 0.8))
-        steps = int(request.form.get('steps', 8))
-        cfg_scale = float(request.form.get('cfg_scale', 6.0))
-        seed = int(request.form.get('seed', -1))
-        return_format = request.form.get('return_format', 'file')
+        if 'application/json' in content_type:
+            # JSON input (like /generate endpoint)
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "JSON body required"}), 400
+            
+            # Parse JSON parameters
+            prompt = data.get('prompt')
+            loop_type = data.get('loop_type', 'auto')
+            bars = data.get('bars')
+            style_strength = float(data.get('style_strength', 0.8))
+            steps = int(data.get('steps', 8))
+            cfg_scale = float(data.get('cfg_scale', 6.0))
+            seed = int(data.get('seed', -1))
+            return_format = data.get('return_format', 'file')
+            
+            # Note: JSON requests cannot include audio files
+            audio_file = None
+            
+        else:
+            # Form data input (existing behavior)
+            prompt = request.form.get('prompt')
+            loop_type = request.form.get('loop_type', 'auto')
+            bars = request.form.get('bars')
+            style_strength = float(request.form.get('style_strength', 0.8))
+            steps = int(request.form.get('steps', 8))
+            cfg_scale = float(request.form.get('cfg_scale', 6.0))
+            seed = int(request.form.get('seed', -1))
+            return_format = request.form.get('return_format', 'file')
+            
+            # Form data can include audio files
+            audio_file = request.files.get('audio_file')
         
         # Check for input audio file (optional for style transfer)
         input_audio = None
