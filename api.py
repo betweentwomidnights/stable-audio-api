@@ -526,7 +526,7 @@ def generate_loop():
     Supports both text-to-audio and style transfer modes.
 
     Generate BPM-aware loop with smart bar calculation.
-    NOW ACCEPTS BOTH JSON AND FORM DATA for better API consistency!
+    NOW ACCEPTS BOTH JSON AND FORM DATA for better API consistency
     
     Form Data (Style Transfer):
     - audio_file: Input audio file (optional)
