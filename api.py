@@ -152,6 +152,77 @@ def health_check():
             "error": str(e)
         }), 500
     
+@app.route('/models/checkpoints', methods=['POST'])
+def list_checkpoints():
+    """
+    List available checkpoints from a Hugging Face repository
+    
+    JSON Body:
+    {
+        "finetune_repo": "thepatch/jerry_grunge"
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "repo": "thepatch/jerry_grunge",
+        "checkpoints": [
+            "jerry_un-encoded_epoch=32-step=2000.ckpt",
+            "jerry_un-encoded_epoch=28-step=1800.ckpt",
+            ...
+        ]
+    }
+    """
+    try:
+        from huggingface_hub import list_repo_files
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+        
+        finetune_repo = data.get('finetune_repo', '').strip()
+        if not finetune_repo:
+            return jsonify({"error": "finetune_repo is required"}), 400
+        
+        # List all files in the repo
+        try:
+            all_files = list_repo_files(repo_id=finetune_repo, repo_type="model")
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": f"Could not access repository: {str(e)}",
+                "hint": "Check that the repository exists and is public"
+            }), 404
+        
+        # Filter for .ckpt files
+        checkpoints = [f for f in all_files if f.endswith('.ckpt')]
+        
+        if not checkpoints:
+            return jsonify({
+                "success": False,
+                "error": "No .ckpt checkpoint files found in repository",
+                "repo": finetune_repo
+            }), 404
+        
+        # Sort checkpoints (optional - by name or try to parse epoch/step)
+        checkpoints.sort()
+        
+        return jsonify({
+            "success": True,
+            "repo": finetune_repo,
+            "checkpoints": checkpoints,
+            "count": len(checkpoints)
+        })
+        
+    except Exception as e:
+        print(f"Checkpoint listing error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    
 @app.route('/models/switch', methods=['POST'])
 def switch_model():
     """
