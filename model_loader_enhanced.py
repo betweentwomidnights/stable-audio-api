@@ -137,6 +137,21 @@ class ModelManager:
         # Fallback 3: Return None to signal using base_repo config
         print(f"   ⚠️  No config detected, will use base_repo config")
         return None
+    
+    def _fetch_prompts_for_repo(self, repo_id: str, checkpoint: str | None = None):
+        from huggingface_hub import hf_hub_download
+        import json
+        try:
+            ppath = hf_hub_download(repo_id=repo_id, filename="prompts.json")
+            with open(ppath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Optional: stamp what we loaded
+            if checkpoint and isinstance(data, dict):
+                data.setdefault("finetune_repo", repo_id)
+                data.setdefault("checkpoint", checkpoint)
+            return data
+        except Exception:
+            return None
 
     def get_model(self, model_spec="standard"):
         """Get model from cache or load it"""
@@ -309,6 +324,8 @@ class ModelManager:
             print(f"   Sample rate: {config.get('sample_rate')}")
             print(f"   Sample size: {config.get('sample_size')}")
 
+            prompts = self._fetch_prompts_for_repo(repo_id=repo, checkpoint=checkpoint_name)
+
             return {
                 "model": model,
                 "config": config,
@@ -320,6 +337,7 @@ class ModelManager:
                 "repo": repo,
                 "checkpoint": checkpoint_name,
                 "base_repo": base_repo,
+                "prompts": prompts,  # <-- add this
             }
 
         except Exception as e:

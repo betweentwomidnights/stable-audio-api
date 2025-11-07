@@ -309,6 +309,86 @@ def models_status():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/models/prompts', methods=['GET'])
+def get_model_prompts():
+    try:
+        cache = model_manager.list_loaded_models()
+        usage_order = cache.get("usage_order", [])
+        # You may need direct access; if so, read model_manager.model_cache instead of list_loaded_models
+        model_cache = getattr(model_manager, "model_cache", {})
+
+        # --- selection inputs ---
+        key = request.args.get("key")
+        repo = request.args.get("repo")
+        checkpoint = request.args.get("checkpoint")
+        prefer = (request.args.get("prefer") or "active").lower()  # active | finetune | recent
+
+        # Helper to resolve a cache_key by repo+checkpoint substrings
+        def find_key_by_repo_ckpt(r, ck):
+            for k in reversed(usage_order):  # prefer most recent
+                entry = model_cache.get(k, {})
+                if (r and r in str(entry.get("repo", ""))) and (ck and ck in str(entry.get("checkpoint", ""))):
+                    return k
+            return None
+
+        # 1) explicit key
+        if key and key in model_cache:
+            selected_key = key
+        # 2) repo+checkpoint
+        elif repo and checkpoint:
+            selected_key = find_key_by_repo_ckpt(repo, checkpoint)
+        else:
+            selected_key = None
+            # 3) prefer active
+            if prefer == "active":
+                active_key = getattr(model_manager, "active_model_key", None)
+                if active_key in model_cache:
+                    selected_key = active_key
+            # 4) prefer finetune
+            if not selected_key and prefer in ("finetune",):
+                for k in reversed(usage_order):
+                    if model_cache.get(k, {}).get("type") == "finetune":
+                        selected_key = k
+                        break
+            # 5) fallback to most recent
+            if not selected_key and usage_order:
+                selected_key = usage_order[-1]
+
+        if not selected_key or selected_key not in model_cache:
+            return jsonify({"success": True, "prompts": None, "message": "no model selected"}), 200
+
+        entry = model_cache[selected_key]
+        prompts = entry.get("prompts")
+
+        # Lazy load prompts.json if this is a finetune and prompts missing
+        try:
+            if entry.get("type") == "finetune" and not prompts:
+                # You added this helper earlier; falls back to None on failure
+                prompts = model_manager._fetch_prompts_for_repo(
+                    repo_id=entry.get("repo"),
+                    checkpoint=entry.get("checkpoint")
+                )
+                entry["prompts"] = prompts
+        except Exception:
+            pass  # non-fatal
+
+        # Normalize payload so JUCE can rely on consistent shape
+        if not prompts:
+            prompts = {"version": 1, "dice": {"generic": [], "drums": [], "instrumental": []}}
+
+        payload = {
+            "success": True,
+            "model_key": selected_key,
+            "type": entry.get("type"),
+            "source": entry.get("repo") or entry.get("source"),
+            "checkpoint": entry.get("checkpoint"),
+            "prompts": prompts,
+        }
+        return jsonify(payload), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/models/clear-cache', methods=['POST'])
 def clear_model_cache():
