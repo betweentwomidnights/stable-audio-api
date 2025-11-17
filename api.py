@@ -441,18 +441,39 @@ def test_finetune():
             "error": str(e)
         }), 500
     
-def sampler_kwargs_for_objective(model, client_overrides=None):
-    """
-    Choose sampler kwargs based on the model's diffusion objective.
-    client_overrides: optional dict from the request payload to let users override.
-    """
-    obj = getattr(model, "diffusion_objective", None)
-    kw = {}
 
-    # Let client override explicitly if they pass something like {"sampler_type": "..."}
+    
+def detect_model_family(config):
+    """Detect if this is SAO 1.0 vs SAOS"""
+    # SAO 1.0 has seconds_start in conditioning
+    cond_configs = config.get("model", {}).get("conditioning", {}).get("configs", [])
+    has_seconds_start = any(c.get("id") == "seconds_start" for c in cond_configs)
+    
+    # Also check sample_size (SAOS max is 524288, SAO 1.0 finetunes are higher)
+    sample_size = config.get("sample_size", 0)
+    is_long_form = sample_size > 524288  # ← Changed from 1000000
+    
+    if has_seconds_start or is_long_form:
+        return "sao1.0"
+    return "saos"
+
+def sampler_kwargs_for_objective(model, config, client_overrides=None):
+    """Choose sampler kwargs based on model family and objective"""
+    obj = getattr(model, "diffusion_objective", None)
+    model_family = detect_model_family(config)
+    kw = {}
+    
     if client_overrides:
         kw.update(client_overrides)
-
+    
+    # SAO 1.0 specific parameters
+    if model_family == "sao1.0":
+        kw.setdefault("sampler_type", "dpmpp-3m-sde")
+        kw.setdefault("sigma_min", 0.3)
+        kw.setdefault("sigma_max", 500)
+        return kw
+    
+    # SAOS parameters (your existing logic)
     if obj in ("rf_denoiser", "rectified_flow"):
         # For rf_* objectives, pingpong is the default for the post-adversarial rf_denoiser.
         # For rectified_flow, safest is to omit sampler_type and let stable-audio-tools choose defaults.
@@ -476,6 +497,8 @@ def generate_audio():
         data = request.get_json()
         if not data:
             return jsonify({"error": "JSON body required"}), 400
+        
+        
 
         # ---- Model selection ----
         model_type = data.get('model_type', 'standard')
@@ -494,6 +517,9 @@ def generate_audio():
         sample_rate = int(config.get("sample_rate", 44100))
         model_sample_size = int(config.get("sample_size", 524288))
         model_seconds_max = max(1, model_sample_size // sample_rate)  # guard
+
+        # Detect model family
+        model_family = detect_model_family(config)
 
         # Client may request seconds_total; default to model max
         req_seconds_total = data.get("seconds_total")
@@ -514,9 +540,11 @@ def generate_audio():
         # ---- Steps default depends on diffusion objective ----
         diffusion_objective = getattr(model, "diffusion_objective", None)
         steps = data.get('steps')
+        # Default steps based on model
         if steps is None:
-            # sensible defaults by objective
-            if diffusion_objective == "rectified_flow":
+            if model_family == "sao1.0":
+                steps = 100  # SAO 1.0 default
+            elif diffusion_objective == "rectified_flow":
                 steps = 50
             else:
                 steps = 8
@@ -558,12 +586,20 @@ def generate_audio():
                 "prompt": negative_prompt,
                 "seconds_total": seconds_total
             }]
+        
+        # Add seconds_start if SAO 1.0
+        if model_family == "sao1.0":
+            seconds_start = data.get("seconds_start", 0)
+            conditioning[0]["seconds_start"] = seconds_start
+            if negative_conditioning:  # ← Fix: Add to negative conditioning too
+                negative_conditioning[0]["seconds_start"] = seconds_start
 
         # ---- Sampler kwargs based on objective (and client override if provided) ----
         client_sampler_overrides = {}
         if "sampler_type" in data:
             client_sampler_overrides["sampler_type"] = data["sampler_type"]
-        skw = sampler_kwargs_for_objective(model, client_sampler_overrides)
+        # Sampler kwargs (now model-family aware)
+        skw = sampler_kwargs_for_objective(model, config, client_sampler_overrides)
 
         print(f"Generating with {model_type} model:")
         print(f"   Prompt: {prompt}")
@@ -591,9 +627,18 @@ def generate_audio():
                 )
         generation_time = time.time() - start_time
 
-        # ---- Post (same as before) ----
+        
+        # ---- Post-processing ----
         output = rearrange(output, "b d n -> d (b n)")
         output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1)
+
+        # NEW: Trim to requested duration (avoid silence padding)
+        requested_samples = seconds_total * sample_rate
+        actual_samples = output.shape[1]
+        if requested_samples < actual_samples:
+            output = output[:, :requested_samples]
+            print(f"   ✂️  Trimmed from {actual_samples/sample_rate:.1f}s to {seconds_total}s")
+
         output_int16 = output.mul(32767).to(torch.int16).cpu()
 
         detected_bpm = extract_bpm(prompt)
@@ -1482,6 +1527,734 @@ def manual_cleanup():
         return jsonify({"message": "GPU cleanup completed successfully"})
     except Exception as e:
         return jsonify({"error": f"Cleanup failed: {str(e)}"}), 500
+    
+
+@app.route('/debug/checkpoint', methods=['GET'])
+def debug_checkpoint_structure():
+    """Debug endpoint to analyze checkpoint structure mismatch"""
+    try:
+        from huggingface_hub import hf_hub_download, login
+        from stable_audio_tools.models import create_model_from_config
+        import json
+        import torch
+        import os
+        
+        results = {"debug_info": []}
+        
+        def add_log(message):
+            results["debug_info"].append(message)
+            print(message)  # Also log to console
+        
+        add_log("🔍 Starting checkpoint structure analysis...")
+        
+        # Authenticate
+        hf_token = os.getenv('HF_TOKEN')
+        if hf_token:
+            login(token=hf_token)
+            add_log(f"✅ HF authenticated")
+        
+        # Download files
+        add_log("📥 Downloading base_model_config.json...")
+        config_path = hf_hub_download(
+            repo_id="stabilityai/stable-audio-open-small",
+            filename="base_model_config.json"
+        )
+        
+        add_log("📥 Downloading finetune checkpoint...")
+        ckpt_path = hf_hub_download(
+            repo_id="S3Sound/am_saos1",
+            filename="am_saos1_e18_s4800.ckpt"
+        )
+        
+        # Load config and create model
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        add_log("🔧 Creating model from base config...")
+        model = create_model_from_config(config)
+        
+        # Get expected model keys
+        model_keys = set(model.state_dict().keys())
+        add_log(f"📊 Model expects {len(model_keys)} keys")
+        
+        model_keys_sample = sorted(model_keys)[:10]
+        results["model_keys_sample"] = model_keys_sample
+        add_log("📝 First 10 expected keys:")
+        for key in model_keys_sample:
+            add_log(f"   {key}")
+        
+        # Load and analyze checkpoint
+        add_log("🎯 Loading checkpoint...")
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        
+        checkpoint_structure = list(checkpoint.keys())
+        results["checkpoint_structure"] = checkpoint_structure
+        add_log(f"🔍 Checkpoint top-level keys: {checkpoint_structure}")
+        
+        # Find the actual state dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            state_dict_key = "state_dict"
+            add_log("   Using checkpoint['state_dict']")
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+            state_dict_key = "model"
+            add_log("   Using checkpoint['model']")
+        else:
+            state_dict = checkpoint
+            state_dict_key = "root"
+            add_log("   Using checkpoint directly")
+        
+        results["state_dict_location"] = state_dict_key
+        
+        checkpoint_keys = set(state_dict.keys())
+        add_log(f"📊 Checkpoint has {len(checkpoint_keys)} keys")
+        
+        checkpoint_keys_sample = sorted(checkpoint_keys)[:10]
+        results["checkpoint_keys_sample"] = checkpoint_keys_sample
+        add_log("📝 First 10 checkpoint keys:")
+        for key in checkpoint_keys_sample:
+            add_log(f"   {key}")
+        
+        # Analyze key patterns
+        add_log("🔍 Key Pattern Analysis:")
+        
+        # Check for common prefixes in checkpoint keys
+        checkpoint_prefixes = set()
+        for key in checkpoint_keys:
+            parts = key.split('.')
+            if len(parts) > 1:
+                checkpoint_prefixes.add(parts[0])
+        
+        checkpoint_prefixes_list = sorted(checkpoint_prefixes)
+        results["checkpoint_prefixes"] = checkpoint_prefixes_list
+        add_log(f"📝 Checkpoint key prefixes: {checkpoint_prefixes_list}")
+        
+        # Check for common prefixes in model keys  
+        model_prefixes = set()
+        for key in model_keys:
+            parts = key.split('.')
+            if len(parts) > 1:
+                model_prefixes.add(parts[0])
+        
+        model_prefixes_list = sorted(model_prefixes)
+        results["model_prefixes"] = model_prefixes_list
+        add_log(f"📝 Model key prefixes: {model_prefixes_list}")
+        
+        # Try different key cleaning strategies
+        add_log("🧪 Testing key cleaning strategies:")
+        
+        strategies = [
+            ("no_cleaning", lambda k: k),
+            ("remove_model_prefix", lambda k: k[6:] if k.startswith('model.') else k),
+            ("remove_ema_model_prefix", lambda k: k[10:] if k.startswith('ema_model.') else k),
+            ("remove_module_prefix", lambda k: k[7:] if k.startswith('module.') else k),
+            ("add_model_prefix", lambda k: f"model.{k}"),
+            ("remove_first_prefix", lambda k: '.'.join(k.split('.')[1:]) if '.' in k else k),
+        ]
+        
+        strategy_results = {}
+        
+        for strategy_name, strategy_func in strategies:
+            cleaned_keys = set(strategy_func(k) for k in checkpoint_keys)
+            
+            missing = model_keys - cleaned_keys
+            unexpected = cleaned_keys - model_keys
+            matching = model_keys & cleaned_keys
+            
+            match_percentage = len(matching)/len(model_keys)*100
+            
+            strategy_info = {
+                "matching": len(matching),
+                "total_model_keys": len(model_keys),
+                "match_percentage": round(match_percentage, 1),
+                "missing": len(missing),
+                "unexpected": len(unexpected)
+            }
+            
+            add_log(f"📊 Strategy '{strategy_name}':")
+            add_log(f"   Matching: {len(matching)}/{len(model_keys)} ({match_percentage:.1f}%)")
+            add_log(f"   Missing: {len(missing)}")
+            add_log(f"   Unexpected: {len(unexpected)}")
+            
+            if len(matching) > len(model_keys) * 0.8:  # If > 80% match
+                add_log(f"   ✅ Good strategy! Sample matches:")
+                sample_matches = []
+                for i, key in enumerate(sorted(matching)):
+                    if i < 5:
+                        original = None
+                        for orig_key in checkpoint_keys:
+                            if strategy_func(orig_key) == key:
+                                original = orig_key
+                                break
+                        match_pair = f"{original} -> {key}"
+                        sample_matches.append(match_pair)
+                        add_log(f"      {match_pair}")
+                
+                strategy_info["sample_matches"] = sample_matches
+                
+                if len(missing) > 0:
+                    add_log(f"   ❌ Sample missing keys:")
+                    sample_missing = sorted(missing)[:5]
+                    strategy_info["sample_missing"] = sample_missing
+                    for key in sample_missing:
+                        add_log(f"      {key}")
+            
+            strategy_results[strategy_name] = strategy_info
+        
+        results["strategy_analysis"] = strategy_results
+        
+        # Check for exact matches
+        if checkpoint_keys == model_keys:
+            add_log("✅ Keys match exactly - this shouldn't be happening!")
+            results["keys_match_exactly"] = True
+        else:
+            results["keys_match_exactly"] = False
+        
+        # Summary and recommendation
+        add_log("🔍 Analysis Summary:")
+        best_strategy = None
+        best_match_rate = 0
+        
+        for strategy_name, info in strategy_results.items():
+            if info["match_percentage"] > best_match_rate:
+                best_match_rate = info["match_percentage"]
+                best_strategy = strategy_name
+        
+        results["best_strategy"] = best_strategy
+        results["best_match_rate"] = best_match_rate
+        
+        if best_match_rate > 80:
+            add_log(f"🎯 RECOMMENDATION: Use '{best_strategy}' strategy ({best_match_rate:.1f}% match)")
+            results["recommendation"] = f"Use '{best_strategy}' strategy"
+        else:
+            add_log("❌ No strategy achieved >80% match. This checkpoint may be incompatible.")
+            results["recommendation"] = "No compatible strategy found"
+        
+        results["success"] = True
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Debug checkpoint error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "debug_info": results.get("debug_info", [])
+        }), 500
+    
+@app.route('/debug/pretransform', methods=['GET'])
+def debug_pretransform():
+    """Debug endpoint to check if checkpoint contains pretransform weights"""
+    try:
+        from huggingface_hub import hf_hub_download, login
+        from stable_audio_tools.models import create_model_from_config
+        from stable_audio_tools import get_pretrained_model
+        import json
+        import torch
+        import os
+        
+        results = {"debug_info": []}
+        
+        def add_log(message):
+            results["debug_info"].append(message)
+            print(message)
+        
+        add_log("🔍 Analyzing pretransform weights...")
+        
+        # Authenticate
+        hf_token = os.getenv('HF_TOKEN')
+        if hf_token:
+            login(token=hf_token)
+        
+        # Load the standard model for comparison
+        add_log("📥 Loading standard SAOS model...")
+        standard_model, standard_config = get_pretrained_model("stabilityai/stable-audio-open-small")
+        standard_keys = set(standard_model.state_dict().keys())
+        
+        # Find pretransform keys in standard model
+        pretransform_keys = {k for k in standard_keys if k.startswith('pretransform.')}
+        non_pretransform_keys = standard_keys - pretransform_keys
+        
+        add_log(f"📊 Standard model analysis:")
+        add_log(f"   Total keys: {len(standard_keys)}")
+        add_log(f"   Pretransform keys: {len(pretransform_keys)}")
+        add_log(f"   Non-pretransform keys: {len(non_pretransform_keys)}")
+        
+        results["standard_model"] = {
+            "total_keys": len(standard_keys),
+            "pretransform_keys": len(pretransform_keys),
+            "non_pretransform_keys": len(non_pretransform_keys)
+        }
+        
+        # Sample pretransform keys
+        sample_pretransform = sorted(pretransform_keys)[:5]
+        results["sample_pretransform_keys"] = sample_pretransform
+        add_log("📝 Sample pretransform keys:")
+        for key in sample_pretransform:
+            add_log(f"   {key}")
+        
+        # Load finetune checkpoint
+        add_log("📥 Loading finetune checkpoint...")
+        ckpt_path = hf_hub_download(
+            repo_id="S3Sound/am_saos1",
+            filename="am_saos1_e18_s4800.ckpt"
+        )
+        
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        if 'state_dict' in checkpoint:
+            finetune_state_dict = checkpoint['state_dict']
+        else:
+            finetune_state_dict = checkpoint
+        
+        finetune_keys = set(finetune_state_dict.keys())
+        finetune_pretransform_keys = {k for k in finetune_keys if k.startswith('pretransform.')}
+        finetune_non_pretransform_keys = finetune_keys - finetune_pretransform_keys
+        
+        add_log(f"📊 Finetune checkpoint analysis:")
+        add_log(f"   Total keys: {len(finetune_keys)}")
+        add_log(f"   Pretransform keys: {len(finetune_pretransform_keys)}")
+        add_log(f"   Non-pretransform keys: {len(finetune_non_pretransform_keys)}")
+        
+        results["finetune_checkpoint"] = {
+            "total_keys": len(finetune_keys),
+            "pretransform_keys": len(finetune_pretransform_keys),
+            "non_pretransform_keys": len(finetune_non_pretransform_keys)
+        }
+        
+        # Check if finetune has pretransform weights
+        if len(finetune_pretransform_keys) == 0:
+            add_log("❌ PROBLEM FOUND: Finetune checkpoint has NO pretransform weights!")
+            add_log("   This explains the static drone - pretransform has random weights")
+            results["has_pretransform_weights"] = False
+            results["problem_identified"] = "Missing pretransform weights in finetune checkpoint"
+        else:
+            add_log("✅ Finetune checkpoint has pretransform weights")
+            results["has_pretransform_weights"] = True
+        
+        # Compare key coverage
+        missing_pretransform = pretransform_keys - finetune_pretransform_keys
+        missing_main_model = non_pretransform_keys - finetune_non_pretransform_keys
+        
+        if missing_pretransform:
+            add_log(f"❌ Missing {len(missing_pretransform)} pretransform keys from finetune")
+            results["missing_pretransform_count"] = len(missing_pretransform)
+        
+        if missing_main_model:
+            add_log(f"❌ Missing {len(missing_main_model)} main model keys from finetune")
+            results["missing_main_model_count"] = len(missing_main_model)
+        
+        # Recommendation
+        add_log("\n🎯 SOLUTION:")
+        if len(finetune_pretransform_keys) == 0:
+            add_log("1. Load pretransform weights from standard SAOS model")
+            add_log("2. Load only main model weights from finetune checkpoint") 
+            add_log("3. This gives us: finetuned diffusion + standard pretransform")
+            results["recommended_approach"] = "hybrid_loading"
+        else:
+            add_log("   Both models have pretransform - investigate further")
+            results["recommended_approach"] = "investigate_further"
+        
+        results["success"] = True
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Debug pretransform error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "debug_info": results.get("debug_info", [])
+        }), 500
+    
+@app.route('/debug/weights', methods=['GET'])
+def debug_weight_comparison():
+    """Compare actual weight values between standard and finetune models"""
+    try:
+        from huggingface_hub import hf_hub_download, login
+        from stable_audio_tools import get_pretrained_model
+        import torch
+        import os
+        
+        results = {"debug_info": []}
+        
+        def add_log(message):
+            results["debug_info"].append(message)
+            print(message)
+        
+        add_log("🔍 Comparing pretransform weight values...")
+        
+        # Authenticate
+        hf_token = os.getenv('HF_TOKEN')
+        if hf_token:
+            login(token=hf_token)
+        
+        # Load standard model
+        add_log("📥 Loading standard SAOS pretransform weights...")
+        standard_model, _ = get_pretrained_model("stabilityai/stable-audio-open-small")
+        standard_state = standard_model.state_dict()
+        
+        # Load finetune checkpoint
+        add_log("📥 Loading finetune checkpoint...")
+        ckpt_path = hf_hub_download(
+            repo_id="S3Sound/am_saos1",
+            filename="am_saos1_e18_s4800.ckpt"
+        )
+        
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        finetune_state = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+        
+        # Compare a few key pretransform weights
+        test_keys = [
+            'pretransform.model.decoder.layers.0.weight_g',
+            'pretransform.model.decoder.layers.0.bias',
+            'pretransform.model.encoder.layers.0.weight_g'
+        ]
+        
+        weight_comparisons = {}
+        
+        for key in test_keys:
+            if key in standard_state and key in finetune_state:
+                std_weight = standard_state[key]
+                ft_weight = finetune_state[key]
+                
+                # Compare shapes
+                shapes_match = std_weight.shape == ft_weight.shape
+                
+                # Compare values (check if they're identical)
+                weights_identical = torch.allclose(std_weight, ft_weight, atol=1e-6)
+                
+                # Get some statistics
+                std_mean = float(std_weight.mean())
+                ft_mean = float(ft_weight.mean())
+                std_std = float(std_weight.std())
+                ft_std = float(ft_weight.std())
+                
+                weight_comparisons[key] = {
+                    "shapes_match": shapes_match,
+                    "weights_identical": weights_identical,
+                    "standard_mean": round(std_mean, 6),
+                    "finetune_mean": round(ft_mean, 6),
+                    "standard_std": round(std_std, 6),
+                    "finetune_std": round(ft_std, 6)
+                }
+                
+                add_log(f"🔍 Key: {key}")
+                add_log(f"   Shapes match: {shapes_match}")
+                add_log(f"   Weights identical: {weights_identical}")
+                add_log(f"   Standard: mean={std_mean:.6f}, std={std_std:.6f}")
+                add_log(f"   Finetune: mean={ft_mean:.6f}, std={ft_std:.6f}")
+                
+        results["weight_comparisons"] = weight_comparisons
+        
+        # Check if ANY pretransform weights are identical
+        identical_pretransform_weights = 0
+        total_pretransform_weights = 0
+        
+        for key in standard_state.keys():
+            if key.startswith('pretransform.') and key in finetune_state:
+                total_pretransform_weights += 1
+                if torch.allclose(standard_state[key], finetune_state[key], atol=1e-6):
+                    identical_pretransform_weights += 1
+        
+        identical_percentage = (identical_pretransform_weights / total_pretransform_weights) * 100
+        
+        add_log(f"📊 Pretransform weight analysis:")
+        add_log(f"   Identical weights: {identical_pretransform_weights}/{total_pretransform_weights}")
+        add_log(f"   Identical percentage: {identical_percentage:.1f}%")
+        
+        results["pretransform_analysis"] = {
+            "identical_weights": identical_pretransform_weights,
+            "total_weights": total_pretransform_weights,
+            "identical_percentage": round(identical_percentage, 1)
+        }
+        
+        # Recommendation
+        if identical_percentage > 95:
+            add_log("✅ Pretransform weights are nearly identical - issue elsewhere")
+            results["recommendation"] = "pretransform_weights_good"
+        elif identical_percentage < 5:
+            add_log("❌ Pretransform weights completely different - use hybrid loading")
+            results["recommendation"] = "use_hybrid_loading"
+        else:
+            add_log("⚠️  Pretransform weights partially different - investigate further")
+            results["recommendation"] = "investigate_partial_difference"
+        
+        results["success"] = True
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Debug weights error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "debug_info": results.get("debug_info", [])
+        }), 500
+    
+@app.route('/debug/loading', methods=['GET'])
+def debug_loading_process():
+    """Compare the loading process between standard and finetune models"""
+    try:
+        results = {"debug_info": []}
+        
+        def add_log(message):
+            results["debug_info"].append(message)
+            print(message)
+        
+        add_log("🔍 Analyzing model loading processes...")
+        
+        # Get both models from our cache
+        if len(model_manager.model_cache) < 2:
+            add_log("❌ Need both models loaded in cache first")
+            return jsonify({
+                "error": "Both models need to be loaded first. Call /test/finetune to load both.",
+                "debug_info": results["debug_info"]
+            }), 400
+        
+        # Find the two models in cache
+        standard_key = "standard_saos"
+        finetune_key = None
+        
+        for key in model_manager.model_cache.keys():
+            if key != standard_key:
+                finetune_key = key
+                break
+        
+        if not finetune_key:
+            add_log("❌ Finetune model not found in cache")
+            return jsonify({"error": "Finetune model not in cache"}), 400
+        
+        standard_data = model_manager.model_cache[standard_key]
+        finetune_data = model_manager.model_cache[finetune_key]
+        
+        add_log(f"📊 Comparing models:")
+        add_log(f"   Standard: {standard_data['source']}")
+        add_log(f"   Finetune: {finetune_data['source']}")
+        
+        # Compare model properties
+        std_model = standard_data["model"]
+        ft_model = finetune_data["model"]
+        
+        # Check model modes
+        std_training = std_model.training
+        ft_training = ft_model.training
+        
+        add_log(f"🔍 Model states:")
+        add_log(f"   Standard training mode: {std_training}")
+        add_log(f"   Finetune training mode: {ft_training}")
+        
+        results["model_states"] = {
+            "standard_training": std_training,
+            "finetune_training": ft_training
+        }
+        
+        # Check model types
+        std_type = type(std_model).__name__
+        ft_type = type(ft_model).__name__
+        
+        add_log(f"🔍 Model types:")
+        add_log(f"   Standard: {std_type}")
+        add_log(f"   Finetune: {ft_type}")
+        
+        results["model_types"] = {
+            "standard": std_type,
+            "finetune": ft_type
+        }
+        
+        # Check if models have same structure
+        std_modules = list(std_model.named_modules())
+        ft_modules = list(ft_model.named_modules())
+        
+        add_log(f"🔍 Model structure:")
+        add_log(f"   Standard modules: {len(std_modules)}")
+        add_log(f"   Finetune modules: {len(ft_modules)}")
+        
+        # Check specific attributes
+        important_attrs = ['sample_rate', 'sample_size', 'model_type']
+        attr_comparison = {}
+        
+        for attr in important_attrs:
+            std_val = getattr(std_model, attr, "NOT_FOUND")
+            ft_val = getattr(ft_model, attr, "NOT_FOUND")
+            
+            attr_comparison[attr] = {
+                "standard": str(std_val),
+                "finetune": str(ft_val),
+                "match": std_val == ft_val
+            }
+            
+            add_log(f"🔍 Attribute {attr}:")
+            add_log(f"   Standard: {std_val}")
+            add_log(f"   Finetune: {ft_val}")
+            add_log(f"   Match: {std_val == ft_val}")
+        
+        results["attribute_comparison"] = attr_comparison
+        
+        # Check configs
+        std_config = standard_data["config"]
+        ft_config = finetune_data["config"]
+        
+        config_match = std_config == ft_config
+        add_log(f"🔍 Configs identical: {config_match}")
+        
+        if not config_match:
+            add_log("❌ Configs differ - this could be the issue!")
+            # Show key differences
+            for key in set(std_config.keys()) | set(ft_config.keys()):
+                std_val = std_config.get(key, "MISSING")
+                ft_val = ft_config.get(key, "MISSING")
+                if std_val != ft_val:
+                    add_log(f"   Config diff - {key}: std={std_val}, ft={ft_val}")
+        
+        results["configs_match"] = config_match
+        
+        # Key insight: Check if we're using the right loading method
+        add_log("\n🎯 ANALYSIS:")
+        add_log("   Standard model loaded via: get_pretrained_model()")
+        add_log("   Finetune model loaded via: create_model_from_config() + manual checkpoint")
+        add_log("\n💡 HYPOTHESIS:")
+        add_log("   Different loading methods might initialize models differently")
+        add_log("   Even with identical weights, initialization/setup could differ")
+        
+        # Recommendation
+        add_log("\n🔧 RECOMMENDED TEST:")
+        add_log("   Try loading finetune using get_pretrained_model() approach")
+        add_log("   Or try loading standard using create_model_from_config() approach")
+        add_log("   This will isolate whether the issue is loading method vs weights")
+        
+        results["recommendation"] = "test_consistent_loading_method"
+        results["success"] = True
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Debug loading error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "debug_info": results.get("debug_info", [])
+        }), 500
+    
+@app.route('/debug/inference', methods=['GET'])
+def debug_inference_params():
+    """Debug what parameters the inference function expects for different diffusion objectives"""
+    try:
+        results = {"debug_info": []}
+        
+        def add_log(message):
+            results["debug_info"].append(message)
+            print(message)
+        
+        add_log("🔍 Analyzing inference parameters for different diffusion objectives...")
+        
+        # Load both models
+        if len(model_manager.model_cache) < 2:
+            return jsonify({
+                "error": "Both models need to be loaded first. Call /test/finetune to load both.",
+                "debug_info": results["debug_info"]
+            }), 400
+        
+        standard_key = "standard_saos"
+        finetune_key = None
+        
+        for key in model_manager.model_cache.keys():
+            if key != standard_key:
+                finetune_key = key
+                break
+        
+        standard_data = model_manager.model_cache[standard_key]
+        finetune_data = model_manager.model_cache[finetune_key]
+        
+        add_log(f"📊 Model comparison:")
+        add_log(f"   Standard: {standard_data['config']['model']['diffusion']['diffusion_objective']}")
+        add_log(f"   Finetune: {finetune_data['config']['model']['diffusion']['diffusion_objective']}")
+        
+        results["diffusion_objectives"] = {
+            "standard": standard_data['config']['model']['diffusion']['diffusion_objective'],
+            "finetune": finetune_data['config']['model']['diffusion']['diffusion_objective']
+        }
+        
+        # Check if models have different attributes that inference might use
+        std_model = standard_data["model"]
+        ft_model = finetune_data["model"]
+        
+        # Look for diffusion_objective attribute on the model itself
+        std_obj = getattr(std_model, 'diffusion_objective', 'NOT_FOUND')
+        ft_obj = getattr(ft_model, 'diffusion_objective', 'NOT_FOUND')
+        
+        add_log(f"🔍 Model diffusion_objective attributes:")
+        add_log(f"   Standard model.diffusion_objective: {std_obj}")
+        add_log(f"   Finetune model.diffusion_objective: {ft_obj}")
+        
+        results["model_attributes"] = {
+            "standard_diffusion_objective": str(std_obj),
+            "finetune_diffusion_objective": str(ft_obj)
+        }
+        
+        # Check what sampler types might be appropriate
+        add_log("🎯 Recommended inference parameters:")
+        
+        if finetune_data['config']['model']['diffusion']['diffusion_objective'] == 'rectified_flow':
+            add_log("   For rectified_flow model:")
+            add_log("     - sampler_type: Try 'euler', 'rk4', or 'midpoint'")
+            add_log("     - sigma_min/sigma_max: May need different noise schedule")
+            add_log("     - steps: Rectified flow often works with fewer steps")
+            
+            results["rectified_flow_recommendations"] = {
+                "sampler_types": ["euler", "rk4", "midpoint"],
+                "note": "Avoid pingpong sampler for rectified flow",
+                "fewer_steps": "Rectified flow often works with fewer steps than rf_denoiser"
+            }
+        
+        if standard_data['config']['model']['diffusion']['diffusion_objective'] == 'rf_denoiser':
+            add_log("   For rf_denoiser model:")
+            add_log("     - sampler_type: 'pingpong' (current)")
+            add_log("     - Works with adversarial training parameters")
+            
+            results["rf_denoiser_recommendations"] = {
+                "sampler_type": "pingpong",
+                "note": "Current inference likely optimized for this"
+            }
+        
+        # Check generate_diffusion_cond signature
+        from stable_audio_tools.inference.generation import generate_diffusion_cond
+        import inspect
+        
+        sig = inspect.signature(generate_diffusion_cond)
+        params = list(sig.parameters.keys())
+        
+        add_log(f"🔧 generate_diffusion_cond parameters:")
+        for param in params:
+            add_log(f"   - {param}")
+        
+        results["generation_function_params"] = params
+        
+        # Key insight
+        add_log("\n💡 KEY INSIGHT:")
+        add_log("   The generate_diffusion_cond function might be hardcoded for rf_denoiser")
+        add_log("   Even if model config says 'rectified_flow', inference uses rf_denoiser methods")
+        add_log("   Need to check if function respects model.diffusion_objective")
+        
+        results["key_insight"] = "generate_diffusion_cond might not respect diffusion_objective from config"
+        results["solution"] = "Need to ensure inference method matches training objective"
+        
+        results["success"] = True
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Debug inference error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "debug_info": results.get("debug_info", [])
+        }), 500
 
 if __name__ == '__main__':
     # Pre-load model on startup

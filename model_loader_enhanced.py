@@ -116,17 +116,19 @@ class ModelManager:
             
             print(f"   ⚠️  No versioned config found for {version_prefix}")
         
-        # FIXED: Fallback 1 - Try generic base_model_config.json from HF repo FIRST
-        try:
-            print(f"   🔍 Trying base_model_config.json from {finetune_repo}...")
-            config_path = hf_hub_download(
-                repo_id=finetune_repo,
-                filename="base_model_config.json"
-            )
-            print(f"   ✅ Config downloaded from HF repo: {config_path}")
-            return config_path
-        except Exception as e:
-            print(f"   ⚠️  No base_model_config.json in finetune repo: {e}")
+        # FIXED: Fallback 1 - Try both naming conventions
+        for config_name in ["base_model_config.json", "model_config.json"]:
+            try:
+                print(f"   🔍 Trying {config_name} from {finetune_repo}...")
+                config_path = hf_hub_download(
+                    repo_id=finetune_repo,
+                    filename=config_name
+                )
+                print(f"   ✅ Config downloaded from HF repo: {config_path}")
+                return config_path
+            except Exception as e:
+                print(f"   ⚠️  No {config_name} in finetune repo")
+                continue
         
         # Fallback 2: Check for local base_model_config.json (backward compat)
         local_config = os.path.abspath("./base_model_config.json")
