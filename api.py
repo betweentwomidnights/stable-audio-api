@@ -27,6 +27,291 @@ from model_loader_enhanced import model_manager, load_model
 
 import soundfile as sf
 
+from stable_audio_tools.inference.utils import prepare_audio
+from stable_audio_tools.inference import generation as sa_generation
+from stable_audio_tools.inference.sampling import sample_rf_guided
+
+import numpy as np
+
+import gc
+import ctypes
+
+def aggressive_cpu_cleanup():
+    """More thorough cleanup of CPU (and CUDA allocator) memory.
+
+    Safe to call after a request finishes. Does NOT unload models by itself,
+    it only cleans up objects that are no longer referenced.
+    """
+    # Extra GC passes to really collect temporary tensors / arrays
+    for _ in range(3):
+        gc.collect()
+
+    # On Linux, ask glibc to return free heap pages to the OS
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        # Non-glibc systems or failure: just ignore
+        pass
+
+    # Clean CUDA allocator bookkeeping
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+def make_fade_mask(T, bars, device, dtype, floor: float = 0.3):
+    """
+    strong on bar 1, gradually decaying to `floor` instead of 0.0
+    """
+    bars = max(int(bars), 1)
+    bar_len = max(T // bars, 1)
+
+    M = torch.zeros((1, 1, T), device=device, dtype=dtype)
+
+    # First bar: full weight
+    M[:, :, :bar_len] = 1.0
+
+    # Remaining bars: linear decay from 1.0 -> floor
+    if bars > 1:
+        remaining = T - bar_len
+        if remaining > 0:
+            ramp = torch.linspace(1.0, floor, remaining, device=device, dtype=dtype)
+            M[:, :, bar_len:] = ramp
+
+    return M
+
+def build_latent_guidance_from_audio(
+    model,
+    input_audio: torch.Tensor,  # [channels, samples]
+    input_sr: int,
+    sample_rate: int,
+    sample_size: int,
+    bars: int,
+    strength: float = 1.0,
+    t_min: float = 0.2,
+    t_max: float = 0.999,
+    mask_mode: str = "fade",          # "first_bar" | "full" | "fade"
+    start_weight: float | None = None,
+    end_weight: float | None = None,
+):
+    """
+    Prepare Hawley-style latent-only inpainting guidance from an input riff.
+
+    - Resamples + crops/pads the riff to model's sample_rate/sample_size
+    - Encodes to latents if model.pretransform is present
+    - Builds a time mask in latent space with an optional fade from
+      start_weight -> end_weight over the clip.
+
+      mask_mode="first_bar":   bar 1 full, rest 0 (then scaled by weights)
+      mask_mode="full":        full clip = 1 (then scaled by weights)
+      mask_mode="fade":        bar 1 strong, later bars decay toward a floor
+    """
+
+    device = next(model.parameters()).device
+
+    # input_audio from process_input_audio: [channels, samples]
+    audio = input_audio.to(device)
+
+    # Ensure [channels, samples]
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    elif audio.dim() > 2:
+        # e.g. [batch, channels, samples] -> [channels, samples]
+        audio = audio.squeeze(0)
+
+    # Match generate_diffusion_cond's io_channels logic
+    io_channels = model.io_channels
+    if getattr(model, "pretransform", None) is not None:
+        io_channels = model.pretransform.io_channels
+
+    # Use stable-audio-tools' prepare_audio to match window length
+    audio_prepared = prepare_audio(
+        audio,
+        in_sr=input_sr,
+        target_sr=sample_rate,
+        target_length=sample_size,
+        target_channels=io_channels,
+        device=device,
+    )  # [channels, sample_size]
+
+    # Encode to latents for SAOS (latent model)
+    if getattr(model, "pretransform", None) is not None:
+        z_y = model.pretransform.encode(audio_prepared)  # [B, C_latent, T_latent]
+    else:
+        z_y = audio_prepared.unsqueeze(0)  # [1, C, T]
+
+    B, C, T = z_y.shape
+
+    # Bar info for logging / fade shapes
+    bars = max(int(bars), 1)
+    bar_len_latent = max(T // bars, 1)
+    first_bar_end = bar_len_latent
+
+    # ---- base mask by mode (before steerable fading) ----
+    mask_mode = (mask_mode or "fade").lower()
+
+    if mask_mode == "full":
+        base_M = torch.ones((1, 1, T), device=device, dtype=z_y.dtype)
+        mask_desc = f"full clip (all {T} frames)"
+
+    elif mask_mode == "fade":
+        # decay to floor, can tune floor if you want
+        base_M = make_fade_mask(T, bars, device=device, dtype=z_y.dtype, floor=0.3)
+        mask_desc = f"fade: first bar_len={bar_len_latent}, then decay toward 0.3"
+
+    else:  # "first_bar" (or unknown -> default)
+        base_M = torch.zeros((1, 1, T), device=device, dtype=z_y.dtype)
+        base_M[:, :, :first_bar_end] = 1.0
+        mask_desc = f"first_bar only: first {first_bar_end}/{T} frames"
+
+    # Expand to batch if needed
+    if B > 1:
+        base_M = base_M.expand(B, -1, -1).contiguous()
+
+    # ---- steerable fade: start_weight -> end_weight over time ----
+    # If not provided, default both to 1.0 (original behavior modulo strength).
+    if start_weight is None:
+        start_weight = 1.0
+    if end_weight is None:
+        end_weight = start_weight
+
+    # ramp(t) in [start_weight, end_weight] over latent time axis
+    if start_weight == end_weight:
+        time_ramp = torch.full(
+            (1, 1, T),
+            fill_value=float(start_weight),
+            device=device,
+            dtype=z_y.dtype,
+        )
+        ramp_desc = f"const={start_weight}"
+    else:
+        ramp = torch.linspace(
+            float(start_weight),
+            float(end_weight),
+            T,
+            device=device,
+            dtype=z_y.dtype,
+        )  # [T]
+        time_ramp = ramp.view(1, 1, T)
+        ramp_desc = f"{start_weight}→{end_weight}"
+
+    if B > 1:
+        time_ramp = time_ramp.expand(B, -1, -1).contiguous()
+
+    # Final mask: base shape (bars/decay) * time_ramp (steerable level)
+    M = base_M * time_ramp
+    M_sq = M ** 2
+
+    guidance = {
+        "mode": "latent_inpaint",
+        "z_y": z_y,       # encoded riff latents
+        "M_sq": M_sq,     # [B,1,T] mask in latent coords
+        "strength": strength,
+        "t_min": t_min,
+        "t_max": t_max,
+    }
+
+    print(
+        f"🎛 Latent guidance: z_y shape={z_y.shape}, "
+        f"mask_mode={mask_mode}, {mask_desc}, "
+        f"fade={ramp_desc}, strength={strength}"
+    )
+    return guidance
+
+
+def generate_diffusion_cond_guided(
+    model,
+    steps: int,
+    cfg_scale: float,
+    conditioning: dict,
+    negative_conditioning: dict,
+    sample_size: int,
+    sample_rate: int,
+    seed: int,
+    device: str,
+    sampler_kwargs: dict,
+    guidance: dict,
+):
+    """
+    Minimal rectified_flow / rf_denoiser generator that uses sample_rf_guided.
+
+    Mirrors stable_audio_tools.inference.generation.generate_diffusion_cond
+    for RF objectives, but with an extra 'guidance' dict.
+    """
+
+    batch_size = 1  # loop use-case
+
+    # --- audio vs latent sizes (THIS WAS THE MISSING BIT) ---
+    audio_sample_size = sample_size  # length in audio samples
+
+    if getattr(model, "pretransform", None) is not None:
+        # Downsample sample_size to latent length
+        sample_size = sample_size // model.pretransform.downsampling_ratio
+
+    # --- seed / RNG ---
+    seed = seed if seed != -1 else np.random.randint(0, 2**32 - 1, dtype=np.uint32)
+    print(f"guided RF seed: {seed}")
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    # --- initial noise in latent or audio space (matching upstream) ---
+    noise = torch.randn([batch_size, model.io_channels, sample_size], device=device)
+
+    # --- conditioning tensors (same as generate_diffusion_cond) ---
+    assert conditioning is not None, "conditioning dict is required"
+    conditioning_tensors = model.conditioner(conditioning, device)
+    conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
+
+    if negative_conditioning is not None:
+        negative_conditioning_tensors = model.conditioner(negative_conditioning, device)
+        negative_conditioning_tensors = model.get_conditioning_inputs(
+            negative_conditioning_tensors, negative=True
+        )
+    else:
+        negative_conditioning_tensors = {}
+
+    # --- dtype casting ---
+    model_dtype = next(model.model.parameters()).dtype
+    noise = noise.type(model_dtype)
+    conditioning_inputs = {
+        k: (v.type(model_dtype) if v is not None else v)
+        for k, v in conditioning_inputs.items()
+    }
+    negative_conditioning_tensors = {
+        k: (v.type(model_dtype) if v is not None else v)
+        for k, v in negative_conditioning_tensors.items()
+    }
+
+    diff_objective = getattr(model, "diffusion_objective", None)
+    if diff_objective not in ("rectified_flow", "rf_denoiser"):
+        raise ValueError(
+            f"generate_diffusion_cond_guided only supports RF objectives, got {diff_objective}"
+        )
+
+    sampler_kwargs = dict(sampler_kwargs or {})
+
+    # --- guided RF sampling ---
+    sampled = sample_rf_guided(
+        model.model,
+        noise,
+        init_data=None,
+        steps=steps,
+        device=device,
+        guidance=guidance,
+        **sampler_kwargs,
+        **conditioning_inputs,
+        **negative_conditioning_tensors,
+    )
+
+    # --- decode latents back to audio if needed ---
+    if getattr(model, "pretransform", None) is not None:
+        sampled = model.pretransform.decode(sampled)  # -> [B, C, audio_len]
+
+    return sampled
+
+
+
 def save_audio(buffer, audio_tensor, sample_rate):
     """Save audio with soundfile backend (supports BytesIO)"""
     # Convert tensor to numpy and transpose for soundfile (expects [samples, channels])
@@ -47,16 +332,15 @@ riff_manager = RiffManager()
 model_cache = {}
 model_lock = threading.Lock()
 
+
+
 @contextmanager
 def resource_cleanup():
-    """Context manager to ensure proper cleanup of GPU resources."""
     try:
         yield
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        gc.collect()
+        # Drop any big locals in the current frame from references if you want
+        aggressive_cpu_cleanup()
 
 # def load_model():
 #     """Load model if not already loaded."""
@@ -1186,6 +1470,184 @@ def generate_loop():
             "success": False,
             "error": str(e)
         }), 500
+    
+@app.route('/generate/loop-guided', methods=['POST'])
+def generate_loop_guided():
+    """
+    Experimental: rectified-flow latent inpainting / “freeze first bar” loop gen.
+    Uses Hawley-style latent guidance via sample_rf_guided.
+    """
+    try:
+        content_type = request.headers.get('Content-Type', '').lower()
+
+        # ----- Parse JSON + file like /generate/loop -----
+        if 'application/json' in content_type:
+            data = request.get_json()
+            return jsonify({"error": "Use multipart/form-data with audio_file for this endpoint"}), 400
+        elif 'multipart/form-data' in content_type:
+            form = request.form
+            files = request.files
+            audio_file = files.get('audio_file')
+            if not audio_file or audio_file.filename == '':
+                return jsonify({"error": "audio_file is required for guided loop"}), 400
+
+            # Model selection
+            model_type = form.get('model_type', 'standard')
+            finetune_repo = form.get('finetune_repo')
+            finetune_checkpoint = form.get('finetune_checkpoint')
+
+            prompt = form.get('prompt')
+            if not prompt:
+                return jsonify({"error": "prompt is required"}), 400
+
+            negative_prompt = form.get('negative_prompt')
+            cfg_scale = float(form.get('cfg_scale', 6.0))
+            steps = int(form.get('steps', 50))
+            seed = int(form.get('seed', -1))
+            loop_type = form.get('loop_type', 'auto')  # reuse your loop typing
+            bars = form.get('bars')  # can be None / "auto" / int as string
+
+            # NEW: guidance options
+            guidance_mask = form.get('guidance_mask', 'fade')
+            guidance_strength = float(form.get('guidance_strength', 1.0))
+
+            start_weight = form.get('guidance_start_weight')
+            end_weight = form.get('guidance_end_weight')
+            start_weight = float(start_weight) if start_weight is not None else None
+            end_weight = float(end_weight) if end_weight is not None else None
+        else:
+            return jsonify({"error": "Unsupported Content-Type"}), 400
+
+        # ----- Load model + config -----
+        model, config, device = load_model(model_type, finetune_repo, finetune_checkpoint)
+        sample_rate = config["sample_rate"]
+        model_sample_size = config["sample_size"]
+
+        # Only support rectified_flow / rf_denoiser for now
+        diff_obj = getattr(model, "diffusion_objective", None)
+        if diff_obj not in ("rectified_flow", "rf_denoiser"):
+            return jsonify({"error": f"guided loop only supports rectified_flow / rf_denoiser (got {diff_obj})"}), 400
+
+        # ----- Load input audio (your guitar riff) -----
+        input_sr, input_audio = process_input_audio(audio_file, target_sr=sample_rate)
+        # input_audio: shape [channels, samples] float32
+
+        # ----- BPM + bars logic (simplified version of /generate/loop) -----
+        detected_bpm = extract_bpm(prompt)
+        if not detected_bpm:
+            return jsonify({"error": "BPM must be in the prompt (e.g. '120bpm')"}), 400
+
+        bpm = detected_bpm
+        seconds_per_bar = 4.0 * 60.0 / bpm
+
+        # Default to auto bars if not provided
+        if bars and bars != "auto":
+            bars = int(bars)
+        else:
+            # reuse your simple auto-bar heuristic: 4 or 8 bars depending on model window
+            max_seconds = model_sample_size / sample_rate
+            # try 8,4,2,1 bars
+            for bar_count in [8, 4, 2, 1]:
+                if bar_count * seconds_per_bar <= max_seconds:
+                    bars = bar_count
+                    break
+            else:
+                bars = 1
+
+        seconds_total = bars * seconds_per_bar
+
+        # ----- Build conditioning like /generate (just reuse structure) -----
+        conditioning = [{
+            "prompt": prompt,
+            "seconds_start": 0.0,
+            "seconds_total": seconds_total,
+        }]
+
+        negative_conditioning = None
+        if negative_prompt:
+            negative_conditioning = [{
+                "prompt": negative_prompt,
+                "seconds_start": 0.0,
+                "seconds_total": seconds_total,
+            }]
+
+        # ----- Sampler kwargs (reuse helper) -----
+        client_overrides = {}
+        # Allow client to override sampler_type for experimentation
+        if 'sampler_type' in form:
+            client_overrides["sampler_type"] = form.get('sampler_type')
+
+        sampler_kwargs = sampler_kwargs_for_objective(model, config, client_overrides)
+
+        # ----- Build latent inpainting guidance from guitar riff -----
+        guidance = build_latent_guidance_from_audio(
+            model=model,
+            input_audio=input_audio,
+            input_sr=input_sr,
+            sample_rate=sample_rate,
+            sample_size=model_sample_size,
+            bars=bars,
+            strength=guidance_strength,
+            t_min=0.2,
+            t_max=0.999,
+            mask_mode=guidance_mask,
+            start_weight=start_weight,
+            end_weight=end_weight,
+        )
+
+        # ----- Call guided generator -----
+        with resource_cleanup():
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            if seed == -1:
+                seed = np.random.randint(0, 2**32 - 1)
+            print(f"🎛 guided loop seed: {seed}")
+
+            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+                output = generate_diffusion_cond_guided(
+                    model=model,
+                    steps=steps,
+                    cfg_scale=cfg_scale,
+                    conditioning=conditioning,
+                    negative_conditioning=negative_conditioning,
+                    sample_size=model_sample_size,
+                    sample_rate=sample_rate,
+                    seed=seed,
+                    device=device,
+                    sampler_kwargs=sampler_kwargs,
+                    guidance=guidance,
+                )
+
+        # ----- Post-process to stereo float32 -----
+        # output: [batch, channels, samples]
+        output = output[0]  # batch=1
+        output = output.to(torch.float32)
+        output = output / (torch.max(torch.abs(output)) + 1e-9)
+        output = output.clamp(-1, 1)
+
+        # Trim to requested loop length
+        requested_samples = int(seconds_total * sample_rate)
+        if output.shape[-1] > requested_samples:
+            output = output[:, :requested_samples]
+
+        # Encode to wav
+        buf = io.BytesIO()
+        
+        save_audio(buf, output, sample_rate)
+        buf.seek(0)
+
+        return send_file(
+            buf,
+            mimetype="audio/wav",
+            as_attachment=True,
+            download_name=f"guided_loop_{uuid.uuid4().hex}.wav",
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/model/info', methods=['GET'])
 def model_info():

@@ -24,6 +24,23 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    python3.10-venv \
+    git \
+    wget \
+    curl \
+    build-essential \
+    software-properties-common \
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Remove problematic system packages that conflict with pip
 RUN apt-get remove -y python3-blinker || true
 
@@ -41,8 +58,8 @@ RUN mkdir -p /app/.cache/huggingface && \
 # Upgrade pip and use virtual environment to avoid system conflicts
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Install PyTorch 2.5+ with CUDA support
-RUN pip install torch>=2.5.0 torchaudio>=2.5.0 --index-url https://download.pytorch.org/whl/cu121
+
+
 
 # Install ML dependencies
 RUN pip install \
@@ -59,14 +76,23 @@ RUN pip install \
 RUN pip install flask flask-cors
 
 # Clone and install stable-audio-tools
-RUN git clone https://github.com/Stability-AI/stable-audio-tools.git /tmp/stable-audio-tools
+RUN git clone https://github.com/sskalnik/stable-audio-tools.git /tmp/stable-audio-tools
 RUN cd /tmp/stable-audio-tools && pip install .
+
+# NEW (PyTorch 2.6 - required for sskalnik's stable-audio-tools fork)
+RUN pip install torch>=2.6.0 torchaudio>=2.6.0 --index-url https://download.pytorch.org/whl/cu121
+RUN pip install torchcodec
 
 # Copy API script
 COPY api.py /app/
 COPY riff_manager.py /app/
+COPY model_loader_enhanced.py /app/
+COPY base_model_config.json /app/ 
 
 COPY riffs/ /app/riffs/
+
+COPY patch_generation.py /app/
+RUN python /app/patch_generation.py
 
 # Create output directory (for debugging/testing)
 RUN mkdir -p /app/outputs
